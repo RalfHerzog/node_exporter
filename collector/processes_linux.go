@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -29,13 +30,20 @@ import (
 )
 
 type processCollector struct {
-	fs          procfs.FS
-	threadAlloc *prometheus.Desc
-	threadLimit *prometheus.Desc
-	procsState  *prometheus.Desc
-	pidUsed     *prometheus.Desc
-	pidMax      *prometheus.Desc
-	logger      log.Logger
+	fs           procfs.FS
+	threadAlloc  *prometheus.Desc
+	threadLimit  *prometheus.Desc
+	procsState   *prometheus.Desc
+	pidUsed      *prometheus.Desc
+	pidMax       *prometheus.Desc
+	perProcUsage *prometheus.Desc
+	logger       log.Logger
+}
+
+type procResUsage struct {
+	rss     int
+	vsize   uint
+	cpuTime float64
 }
 
 func init() {
@@ -72,11 +80,15 @@ func NewProcessStatCollector(logger log.Logger) (Collector, error) {
 		pidMax: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "max_processes"),
 			"Number of max PIDs limit", nil, nil,
 		),
+		perProcUsage: prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, "usage"),
+			"Per process usage of system resources",
+			[]string{"pid", "resource"}, nil,
+		),
 		logger: logger,
 	}, nil
 }
 func (c *processCollector) Update(ch chan<- prometheus.Metric) error {
-	pids, states, threads, err := c.getAllocatedThreads()
+	pids, states, threads, pidToUsage, err := c.getAllocatedThreads()
 	if err != nil {
 		return fmt.Errorf("unable to retrieve number of allocated threads: %w", err)
 	}
@@ -92,6 +104,13 @@ func (c *processCollector) Update(ch chan<- prometheus.Metric) error {
 		ch <- prometheus.MustNewConstMetric(c.procsState, prometheus.GaugeValue, float64(states[state]), state)
 	}
 
+	for pid, usage := range pidToUsage {
+		pidStr := strconv.Itoa(pid)
+		ch <- prometheus.MustNewConstMetric(c.perProcUsage, prometheus.GaugeValue, float64(usage.rss), pidStr, "rss")
+		ch <- prometheus.MustNewConstMetric(c.perProcUsage, prometheus.GaugeValue, float64(usage.vsize), pidStr, "vsize")
+		ch <- prometheus.MustNewConstMetric(c.perProcUsage, prometheus.GaugeValue, usage.cpuTime, pidStr, "cpu_time")
+	}
+
 	pidM, err := readUintFromFile(procFilePath("sys/kernel/pid_max"))
 	if err != nil {
 		return fmt.Errorf("unable to retrieve limit number of maximum pids alloved: %w", err)
@@ -102,14 +121,15 @@ func (c *processCollector) Update(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
-func (c *processCollector) getAllocatedThreads() (int, map[string]int32, int, error) {
+func (c *processCollector) getAllocatedThreads() (int, map[string]int32, int, map[int]procResUsage, error) {
 	p, err := c.fs.AllProcs()
 	if err != nil {
-		return 0, nil, 0, fmt.Errorf("unable to list all processes: %w", err)
+		return 0, nil, 0, nil, fmt.Errorf("unable to list all processes: %w", err)
 	}
 	pids := 0
 	thread := 0
 	procStates := make(map[string]int32)
+	pidToUsage := make(map[int]procResUsage)
 	for _, pid := range p {
 		stat, err := pid.Stat()
 		if err != nil {
@@ -119,11 +139,12 @@ func (c *processCollector) getAllocatedThreads() (int, map[string]int32, int, er
 				continue
 			}
 			level.Debug(c.logger).Log("msg", "error reading stat for pid", "pid", pid.PID, "err", err)
-			return 0, nil, 0, fmt.Errorf("error reading stat for pid %d: %w", pid.PID, err)
+			return 0, nil, 0, nil, fmt.Errorf("error reading stat for pid %d: %w", pid.PID, err)
 		}
 		pids++
 		procStates[stat.State]++
+		pidToUsage[pid.PID] = procResUsage{rss: stat.ResidentMemory(), vsize: stat.VirtualMemory(), cpuTime: stat.CPUTime()}
 		thread += stat.NumThreads
 	}
-	return pids, procStates, thread, nil
+	return pids, procStates, thread, pidToUsage, nil
 }
